@@ -1,6 +1,8 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect} from "react";
 import { createRoot } from "react-dom/client";
-import { GoogleGenAI, Type, Schema } from "@google/genai";
+//import { GoogleGenAI, Type, Schema } from "@google/genai";
+import { db } from "./firebase.ts";
+import { collection, addDoc, deleteDoc, doc, onSnapshot, query, orderBy } from "firebase/firestore";
 
 // --- Types ---
 
@@ -41,76 +43,89 @@ type View = "landing" | "teacher-dash" | "teacher-create" | "teacher-notes" | "t
 
 // --- API & Helper Functions ---
 
-const genAI = new GoogleGenAI({ apiKey: process.env.API_KEY });
+//const genAI = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-const generateQuiz = async (prompt: string, numQuestions: number, fileBase64: string | null = null, mimeType: string | null = null): Promise<Quiz | null> => {
-  try {
-    const parts: any[] = [];
-    
-    if (fileBase64 && mimeType) {
-      parts.push({
-        inlineData: {
-          data: fileBase64,
-          mimeType: mimeType,
-        },
-      });
-      parts.push({
-        text: `Generate a quiz based on this document. Create exactly ${numQuestions} multiple choice questions.`,
-      });
-    } else {
-      parts.push({
-        text: `Generate a quiz based on the following topic/content: "${prompt}". Create exactly ${numQuestions} multiple choice questions.`,
-      });
-    }
+const generateQuiz = async (
+  prompt: string,
+  numQuestions: number,
+  fileBase64: string | null = null,
+  mimeType: string | null = null
+): Promise<Quiz | null> => {
+  const res = await fetch("/api/generate-quiz", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      prompt,
+      numQuestions,
+      fileBase64,
+      mimeType,
+    }),
+  });
 
-    const response = await genAI.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: { parts },
-      config: {
-        systemInstruction: "You are a helpful teacher's assistant designed to create educational quizzes.",
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            title: { type: Type.STRING, description: "A creative title for the quiz" },
-            questions: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  text: { type: Type.STRING, description: "The question text" },
-                  options: { 
-                    type: Type.ARRAY, 
-                    items: { type: Type.STRING },
-                    description: "4 possible answers"
-                  },
-                  correctIndex: { type: Type.INTEGER, description: "Index of the correct answer (0-3)" }
-                },
-                required: ["text", "options", "correctIndex"]
-              }
-            }
-          },
-          required: ["title", "questions"]
-        }
-      }
-    });
-
-    if (response.text) {
-      const data = JSON.parse(response.text);
-      return {
-        id: crypto.randomUUID(),
-        title: data.title,
-        questions: data.questions,
-        durationMinutes: 10, // Default duration
-        createdAt: Date.now(),
-      };
-    }
-    return null;
-  } catch (error) {
-    console.error("Quiz generation failed:", error);
-    throw error;
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(err || "Quiz generation failed");
   }
+
+  const data = await res.json();
+
+  return {
+    id: crypto.randomUUID(),
+    title: data.title,
+    questions: data.questions,
+    durationMinutes: 10,
+    createdAt: Date.now(),
+  };
 };
+
+    // const response = await genAI.models.generateContent({
+    //   model: "gemini-3-flash-preview",
+    //   contents: { parts },
+    //   config: {
+    //     systemInstruction: "You are a helpful teacher's assistant designed to create educational quizzes.",
+    //     responseMimeType: "application/json",
+    //     responseSchema: {
+    //       type: Type.OBJECT,
+    //       properties: {
+    //         title: { type: Type.STRING, description: "A creative title for the quiz" },
+    //         questions: {
+    //           type: Type.ARRAY,
+    //           items: {
+    //             type: Type.OBJECT,
+    //             properties: {
+    //               text: { type: Type.STRING, description: "The question text" },
+    //               options: { 
+    //                 type: Type.ARRAY, 
+    //                 items: { type: Type.STRING },
+    //                 description: "4 possible answers"
+    //               },
+    //               correctIndex: { type: Type.INTEGER, description: "Index of the correct answer (0-3)" }
+    //             },
+    //             required: ["text", "options", "correctIndex"]
+    //           }
+    //         }
+    //       },
+    //       required: ["title", "questions"]
+    //     }
+    //   }
+    // });
+
+//     if (response.text) {
+//       const data = JSON.parse(response.text);
+//       return {
+//         id: crypto.randomUUID(),
+//         title: data.title,
+//         questions: data.questions,
+//         durationMinutes: 10, // Default duration
+//         createdAt: Date.now(),
+//       };
+//     }
+//     return null;
+//   } catch (error) {
+//     console.error("Quiz generation failed:", error);
+//     throw error;
+//   }
+// };
 
 const downloadPDF = (quiz: Quiz) => {
   // @ts-ignore
@@ -219,6 +234,7 @@ const App = () => {
   // Auth State
   const [showAuth, setShowAuth] = useState(false);
   const [authPassword, setAuthPassword] = useState("");
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
 
   // Creation State
   const [isGenerating, setIsGenerating] = useState(false);
@@ -243,35 +259,35 @@ const App = () => {
   // Leaderboard State
   const [leaderboardQuiz, setLeaderboardQuiz] = useState<Quiz | null>(null);
 
-  // Load data on mount
+  // Firebase Real-time Subscriptions
   useEffect(() => {
-    const savedQuizzes = localStorage.getItem("ai_quizzes");
-    const savedResults = localStorage.getItem("ai_results");
-    const savedNotes = localStorage.getItem("ai_notes");
-    if (savedQuizzes) setQuizzes(JSON.parse(savedQuizzes));
-    if (savedResults) setResults(JSON.parse(savedResults));
-    if (savedNotes) setNotes(JSON.parse(savedNotes));
+    // Subscribe to Quizzes
+    const qQuery = query(collection(db, "quizzes"), orderBy("createdAt", "desc"));
+    const unsubscribeQuizzes = onSnapshot(qQuery, (snapshot) => {
+      const quizzesData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Quiz));
+      setQuizzes(quizzesData);
+    });
+
+    // Subscribe to Notes
+    const nQuery = query(collection(db, "notes"), orderBy("createdAt", "desc"));
+    const unsubscribeNotes = onSnapshot(nQuery, (snapshot) => {
+      const notesData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Note));
+      setNotes(notesData);
+    });
+
+    // Subscribe to Results
+    const rQuery = query(collection(db, "results"), orderBy("date", "desc"));
+    const unsubscribeResults = onSnapshot(rQuery, (snapshot) => {
+      const resultsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Result));
+      setResults(resultsData);
+    });
+
+    return () => {
+      unsubscribeQuizzes();
+      unsubscribeNotes();
+      unsubscribeResults();
+    };
   }, []);
-
-  // Save data on change
-  useEffect(() => {
-    localStorage.setItem("ai_quizzes", JSON.stringify(quizzes));
-  }, [quizzes]);
-
-  useEffect(() => {
-    localStorage.setItem("ai_results", JSON.stringify(results));
-  }, [results]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem("ai_notes", JSON.stringify(notes));
-    } catch (e) {
-      alert("Storage limit reached! Could not save the latest note. Please delete some items.");
-      // Revert state if save failed to keep UI in sync with storage
-      const savedNotes = localStorage.getItem("ai_notes");
-      if (savedNotes) setNotes(JSON.parse(savedNotes));
-    }
-  }, [notes]);
 
   // Timer Effect
   useEffect(() => {
@@ -293,6 +309,7 @@ const App = () => {
 
   const handleAuth = () => {
     if (authPassword === "admin") {
+      setIsAuthenticated(true);
       setView("teacher-dash");
       setShowAuth(false);
       setAuthPassword("");
@@ -302,6 +319,7 @@ const App = () => {
   };
 
   const handleCreateQuiz = async () => {
+    if (!isAuthenticated) return alert("Unauthorized");
     if (!prompt && !file) {
       setError("Please provide a topic or upload a file.");
       return;
@@ -338,6 +356,7 @@ const App = () => {
   };
 
   const handleUploadNote = async () => {
+    if (!isAuthenticated) return alert("Unauthorized");
     if (!noteTitle || !noteFile) {
       setNoteError("Please provide a title and a file.");
       return;
@@ -355,17 +374,16 @@ const App = () => {
         reader.readAsDataURL(noteFile);
       });
 
-      const newNote: Note = {
-        id: crypto.randomUUID(),
+      // Add to Firestore
+      await addDoc(collection(db, "notes"), {
         title: noteTitle,
         description: "",
         fileName: noteFile.name,
         fileData: fileBase64,
         mimeType: noteFile.type,
         createdAt: Date.now(),
-      };
+      });
 
-      setNotes([newNote, ...notes]);
       setNoteTitle("");
       setNoteFile(null);
       alert("Note uploaded successfully!");
@@ -374,14 +392,25 @@ const App = () => {
     }
   };
 
-  const publishQuiz = () => {
+  const publishQuiz = async () => {
+    if (!isAuthenticated) return alert("Unauthorized");
     if (generatedQuiz) {
-      setQuizzes([generatedQuiz, ...quizzes]);
-      setGeneratedQuiz(null);
-      setPrompt("");
-      setFile(null);
-      setNumQuestions(5);
-      setView("teacher-dash");
+      try {
+        // Remove the local ID so Firestore generates one
+        const { id, ...quizData } = generatedQuiz;
+        await addDoc(collection(db, "quizzes"), {
+            ...quizData,
+            createdAt: Date.now()
+        });
+        
+        setGeneratedQuiz(null);
+        setPrompt("");
+        setFile(null);
+        setNumQuestions(5);
+        setView("teacher-dash");
+      } catch (e: any) {
+        alert("Error publishing quiz: " + e.message);
+      }
     }
   };
 
@@ -396,7 +425,7 @@ const App = () => {
     setView("student-quiz");
   };
 
-  const submitQuiz = () => {
+  const submitQuiz = async () => {
     if (!activeQuiz) return;
     
     let score = 0;
@@ -404,8 +433,7 @@ const App = () => {
       if (answers[i] === q.correctIndex) score++;
     });
 
-    const result: Result = {
-      id: crypto.randomUUID(),
+    const resultData = {
       quizId: activeQuiz.id,
       studentName,
       score,
@@ -413,15 +441,33 @@ const App = () => {
       date: Date.now()
     };
 
-    setResults([...results, result]);
-    setCurrentResult(result);
-    setView("student-result");
+    try {
+      // Add to Firestore
+      const docRef = await addDoc(collection(db, "results"), resultData);
+      
+      const newResult: Result = { id: docRef.id, ...resultData };
+      setCurrentResult(newResult);
+      setView("student-result");
+    } catch (e: any) {
+      alert("Error submitting quiz: " + e.message);
+    }
   };
 
   const getLeaderboard = (quizId: string) => {
     return results
       .filter(r => r.quizId === quizId)
       .sort((a, b) => b.score - a.score);
+  };
+
+  const deleteNote = async (noteId: string) => {
+    if (!isAuthenticated) return alert("Unauthorized");
+    if (confirm("Delete this note?")) {
+        try {
+            await deleteDoc(doc(db, "notes", noteId));
+        } catch (e: any) {
+            alert("Error deleting note: " + e.message);
+        }
+    }
   };
 
   // --- Views ---
@@ -580,7 +626,7 @@ const App = () => {
               </div>
               {noteError && <p className="text-red-600 text-sm">{noteError}</p>}
               <Button onClick={handleUploadNote}>Upload Note</Button>
-              <p className="text-xs text-gray-500 mt-2">Note: Large files may not save due to browser storage limits. Please keep PDFs under 1MB.</p>
+              <p className="text-xs text-gray-500 mt-2">Note: Large files may not save. Please keep PDFs under 1MB.</p>
             </div>
           </Card>
 
@@ -600,11 +646,7 @@ const App = () => {
                       <p className="text-xs text-gray-500">Uploaded: {new Date(note.createdAt).toLocaleDateString()}</p>
                     </div>
                   </div>
-                  <Button variant="danger" className="text-sm" onClick={() => {
-                    if (confirm("Delete this note?")) {
-                      setNotes(notes.filter(n => n.id !== note.id));
-                    }
-                  }}>Delete</Button>
+                  <Button variant="danger" className="text-sm" onClick={() => deleteNote(note.id)}>Delete</Button>
                 </Card>
               ))
             )}
